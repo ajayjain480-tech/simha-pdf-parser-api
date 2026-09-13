@@ -1,6 +1,8 @@
 """
 Invoice/receipt structured-field extraction.
 Built on top of the generic text/table extraction in parser.py.
+Uses table-structure extraction where available (most reliable), with
+regex/heuristic fallback on raw text for invoices without real tables.
 """
 import re
 from typing import Optional
@@ -8,8 +10,10 @@ from typing import Optional
 from app.parser import parse_pdf
 
 DATE_PATTERNS = [
-    r"\b(\d{1,2}[-\/](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[-\/]\d{2,4})\b",
-    r"\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{2,4})\b",
+    r"\b(\d{1,2}[-\/\.](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[-\/\.]\d{2,4})\b",
+    r"\b(\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{2,4})\b",
+    r"\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{2,4})\b",
+    r"\b(\d{1,2}\.\d{1,2}\.\d{2,4})\b",
     r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b",
     r"\b(\d{4}[/-]\d{1,2}[/-]\d{1,2})\b",
 ]
@@ -18,11 +22,24 @@ INVOICE_NUMBER_PATTERNS = [
     r"(?:invoice|inv|bill|receipt)\s*(?:no\.?|number|#)\s*[:\-]?\s*([A-Za-z0-9][A-Za-z0-9\-\/]{2,20})",
 ]
 
-TOTAL_LINE_KEYWORDS = [r"grand\s*total", r"total\s*amount", r"amount\s*due", r"total\s*due", r"balance\s*due", r"^total\b"]
+TOTAL_LINE_KEYWORDS = [
+    r"grand\s*total", r"total\s*amount", r"amount\s*due", r"total\s*due",
+    r"balance\s*due", r"net\s*payable", r"total\s*payable", r"amount\s*payable",
+    r"^total\b",
+]
 TAX_LINE_KEYWORDS = [r"\b(cgst|sgst|igst|gst|vat|tax)\b"]
 
-VENDOR_LINE_HINTS = ["ltd", "llp", "pvt", "inc", "corp", "technologies", "solutions", "enterprises", "timber", "traders", "industries"]
-INVOICE_TITLE_STOPWORDS = ["tax invoice", "invoice", "bill", "receipt", "proforma invoice", "credit note", "debit note", "original", "duplicate"]
+VENDOR_LINE_HINTS = ["ltd", "llp", "pvt", "inc", "corp", "technologies", "solutions", "enterprises", "timber", "traders", "industries", "exports", "consulting", "chemicals", "textiles", "agro", "retail", "group"]
+INVOICE_TITLE_STOPWORDS = ["tax invoice", "invoice", "bill", "receipt", "proforma invoice", "credit note", "debit note", "original", "duplicate", "tax invoice / bill of supply"]
+LABEL_STOPWORDS = ["dated", "gstin", "state", "name", "code", "buyer", "bill", "to", "invoice", "no"]
+
+TABLE_HEADER_HINTS = {
+    "description": ["description", "item", "product", "particulars", "goods"],
+    "quantity": ["qty", "quantity"],
+    "unit_price": ["rate", "price", "unit price", "unit rate"],
+    "tax": ["tax", "gst", "vat", "cgst", "sgst", "igst"],
+    "amount": ["amount", "total", "value"],
+}
 
 
 def _has_digit(s: str) -> bool:
@@ -35,6 +52,20 @@ def _search_first_valid(patterns, text, flags=re.IGNORECASE, validator=None):
             val = m.group(1).strip()
             if validator is None or validator(val):
                 return val
+    return None
+
+
+def _find_invoice_number(text: str) -> Optional[str]:
+    for m in re.finditer(r"(?:invoice|inv|bill|receipt)\s*(?:no\.?|number|#)", text, re.IGNORECASE):
+        window = text[m.end():m.end() + 150]
+        for token in re.split(r"[\s:|]+", window):
+            token = token.strip(".,")
+            if not token:
+                continue
+            if token.lower() in LABEL_STOPWORDS:
+                continue
+            if _has_digit(token) and 3 <= len(token) <= 20:
+                return token
     return None
 
 
@@ -75,26 +106,61 @@ def _extract_tax_amount(text: str) -> Optional[str]:
     for line in text.splitlines():
         low = line.lower()
         if any(re.search(kw, low) for kw in TAX_LINE_KEYWORDS):
-            numbers = re.findall(r"[\d,]+\.\d{2}", line)  # require decimals so bare "9%" isn't grabbed
+            numbers = re.findall(r"[\d,]+\.\d{2}", line)
             if numbers:
                 total_tax += float(numbers[-1].replace(",", ""))
                 found = True
     return f"{total_tax:.2f}" if found else None
 
 
-def _extract_line_items(text: str) -> list[dict]:
-    """
-    Heuristic line-item extraction, tolerant of extra unit tokens (e.g. "pcs")
-    and HSN/SAC codes interleaved with numbers. Still an MVP heuristic —
-    accuracy should be validated against more real invoices over time.
-    """
+def _extract_line_items_from_tables(all_tables: list) -> list[dict]:
+    """Match a table's header row generically to description/qty/rate/tax/amount
+    columns, then map every data row. Works regardless of column order or count."""
+    for table in all_tables:
+        if not table or len(table) < 2:
+            continue
+        header = [(c or "").strip().lower() for c in table[0]]
+        col_map = {}
+        for key, hints in TABLE_HEADER_HINTS.items():
+            for i, h in enumerate(header):
+                if any(hint == h or hint in h for hint in hints):
+                    if key not in col_map:
+                        col_map[key] = i
+        if "description" not in col_map or "amount" not in col_map:
+            continue  # not a line-items table
+
+        items = []
+        for row in table[1:]:
+            if not row or all(not (c or "").strip() for c in row):
+                continue
+            desc_idx = col_map["description"]
+            desc = (row[desc_idx] or "").strip() if desc_idx < len(row) else ""
+            if not desc or desc.lower() in ("total", "grand total", "subtotal"):
+                continue
+            item = {"description": desc}
+            for key in ["quantity", "unit_price", "tax", "amount"]:
+                idx = col_map.get(key)
+                if idx is None or idx >= len(row):
+                    continue
+                val = (row[idx] or "").strip()
+                m = re.search(r"[\d,]+\.?\d*", val)
+                if m:
+                    item[key] = m.group(0).replace(",", "")
+            items.append(item)
+        if items:
+            return items
+    return []
+
+
+def _extract_line_items_regex(text: str) -> list[dict]:
+    """Fallback for invoices without a real extractable table structure."""
     items = []
     pattern = re.compile(
-        r"^\s*\d+\s+(.{3,60}?)\s+(?:\d{4,8}\s+)?"          # sl no, description, optional HSN code
-        r"([\d,]+\.?\d*)\s*(?:pcs|kg|nos|units?)?\s+"        # quantity
-        r"(?:[\d,]+\.?\d*\s*(?:pcs|kg|nos|units?)?\s+)?"    # optional second qty column
-        r"([\d,]+\.?\d*)\s*(?:pcs|kg|nos|units?)?\s+"        # rate
-        r"([\d,]+\.?\d*)\s*$",                                # amount (last number on line)
+        r"^\s*\d+\s+(.{3,60}?)\s+(?:\d{4,8}\s+)?"
+        r"([\d,]+\.?\d*)\s*(?:pcs|kg|nos|units?)?\s+"
+        r"(?:[\d,]+\.?\d*\s*(?:pcs|kg|nos|units?)?\s+)?"
+        r"([\d,]+\.?\d*)\s*(?:pcs|kg|nos|units?)?\s+"
+        r"([\d,]+\.?\d*)\s*$",
         re.IGNORECASE,
     )
     for line in text.splitlines():
@@ -107,32 +173,53 @@ def _extract_line_items(text: str) -> list[dict]:
                 "amount": m.group(4).replace(",", ""),
             })
     return items
-LABEL_STOPWORDS = ["dated", "gstin", "state", "name", "code", "buyer", "bill", "to", "invoice", "no"]
 
-def _find_invoice_number(text: str) -> Optional[str]:
-    for m in re.finditer(r"(?:invoice|inv|bill|receipt)\s*(?:no\.?|number|#)", text, re.IGNORECASE):
-        window = text[m.end():m.end() + 150]
-        for token in re.split(r"[\s:|]+", window):
-            token = token.strip(".,")
-            if not token:
+
+def _sum_table_tax_column(all_tables: list) -> Optional[str]:
+    for table in all_tables:
+        if not table or len(table) < 2:
+            continue
+        header = [(c or "").strip().lower() for c in table[0]]
+        tax_idx = None
+        for i, h in enumerate(header):
+            if any(hint == h or hint in h for hint in TABLE_HEADER_HINTS["tax"]):
+                tax_idx = i
+                break
+        if tax_idx is None:
+            continue
+        total = 0.0
+        found = False
+        for row in table[1:]:
+            if not row or tax_idx >= len(row):
                 continue
-            if token.lower() in LABEL_STOPWORDS:
-                continue
-            if _has_digit(token) and 3 <= len(token) <= 20:
-                return token
+            val = (row[tax_idx] or "").strip()
+            m = re.search(r"[\d,]+\.?\d*", val)
+            if m:
+                total += float(m.group(0).replace(",", ""))
+                found = True
+        if found:
+            return f"{total:.2f}"
     return None
+
 
 def extract_invoice_fields(file_bytes: bytes) -> dict:
     parsed = parse_pdf(file_bytes, extract_tables=True)
     full_text = parsed["full_text"]
     lines = full_text.splitlines()
+    all_tables = [t for p in parsed["pages"] for t in p.get("tables", [])]
 
     vendor = _guess_vendor(lines)
     invoice_number = _find_invoice_number(full_text)
     date = _search_first_valid(DATE_PATTERNS, full_text)
     total = _last_number_on_matching_line(TOTAL_LINE_KEYWORDS, full_text)
+
+    line_items = _extract_line_items_from_tables(all_tables)
+    if not line_items:
+        line_items = _extract_line_items_regex(full_text)
+
     tax = _extract_tax_amount(full_text)
-    line_items = _extract_line_items(full_text)
+    if tax is None:
+        tax = _sum_table_tax_column(all_tables)
 
     fields_found = sum(1 for v in [vendor, invoice_number, date, total] if v)
     confidence = round(fields_found / 4, 2)
