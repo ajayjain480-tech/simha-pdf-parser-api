@@ -44,12 +44,12 @@ def _guess_vendor(lines: list[str]) -> Optional[str]:
         low = line.lower()
         if any(hint in low for hint in VENDOR_LINE_HINTS):
             cut = re.split(r"\b(invoice|dated|gstin|state name|buyer|bill to)\b", line, flags=re.IGNORECASE)[0]
-                return cut.strip()
+            return cut.strip()
     for line in candidates:
         low = line.lower()
         if low not in INVOICE_TITLE_STOPWORDS and not any(low.startswith(sw) for sw in INVOICE_TITLE_STOPWORDS):
             cut = re.split(r"\b(invoice|dated|gstin|state name|buyer|bill to)\b", line, flags=re.IGNORECASE)[0]
-                return cut.strip()
+            return cut.strip()
     return candidates[0] if candidates else None
 
 
