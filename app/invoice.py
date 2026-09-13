@@ -29,6 +29,14 @@ TOTAL_LINE_KEYWORDS = [
 ]
 TAX_LINE_KEYWORDS = [r"\b(cgst|sgst|igst|gst|vat|tax)\b"]
 
+TAX_COMPONENT_KEYWORDS = {
+    "cgst_amount": [r"\bcgst\b"],
+    "sgst_amount": [r"\bsgst\b", r"\butgst\b"],
+    "igst_amount": [r"\bigst\b"],
+    "vat_amount": [r"\bvat\b"],
+    "sales_tax_amount": [r"\bsales\s*tax\b"],
+}
+
 VENDOR_LINE_HINTS = ["ltd", "llp", "pvt", "inc", "corp", "technologies", "solutions", "enterprises", "timber", "traders", "industries", "exports", "consulting", "chemicals", "textiles", "agro", "retail", "group"]
 INVOICE_TITLE_STOPWORDS = ["tax invoice", "invoice", "bill", "receipt", "proforma invoice", "credit note", "debit note", "original", "duplicate", "tax invoice / bill of supply"]
 LABEL_STOPWORDS = ["dated", "gstin", "state", "name", "code", "buyer", "bill", "to", "invoice", "no"]
@@ -111,6 +119,22 @@ def _extract_tax_amount(text: str) -> Optional[str]:
                 total_tax += float(numbers[-1].replace(",", ""))
                 found = True
     return f"{total_tax:.2f}" if found else None
+
+
+def _extract_tax_components(text: str) -> dict:
+    result = {}
+    for field, keywords in TAX_COMPONENT_KEYWORDS.items():
+        total = 0.0
+        found = False
+        for line in text.splitlines():
+            low = line.lower()
+            if any(re.search(kw, low) for kw in keywords):
+                numbers = re.findall(r"[\d,]+\.\d{2}", line)
+                if numbers:
+                    total += float(numbers[-1].replace(",", ""))
+                    found = True
+        result[field] = f"{total:.2f}" if found else None
+    return result
 
 
 def _extract_line_items_from_tables(all_tables: list) -> list[dict]:
@@ -221,6 +245,8 @@ def extract_invoice_fields(file_bytes: bytes) -> dict:
     if tax is None:
         tax = _sum_table_tax_column(all_tables)
 
+    tax_components = _extract_tax_components(full_text)
+
     fields_found = sum(1 for v in [vendor, invoice_number, date, total] if v)
     confidence = round(fields_found / 4, 2)
 
@@ -230,6 +256,11 @@ def extract_invoice_fields(file_bytes: bytes) -> dict:
         "date": date,
         "total_amount": total,
         "tax_amount": tax,
+        "cgst_amount": tax_components["cgst_amount"],
+        "sgst_amount": tax_components["sgst_amount"],
+        "igst_amount": tax_components["igst_amount"],
+        "vat_amount": tax_components["vat_amount"],
+        "sales_tax_amount": tax_components["sales_tax_amount"],
         "line_items": line_items,
         "confidence": confidence,
         "page_count": parsed["page_count"],
