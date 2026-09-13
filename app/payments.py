@@ -70,13 +70,20 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
         if not hmac.compare_digest(expected, x_razorpay_signature or ""):
             raise HTTPException(400, "Invalid webhook signature")
 
-    payload = json.loads(body)
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Malformed JSON body")
+
     event = payload.get("event", "")
 
     if event == "payment.captured":
-        payment_entity = payload["payload"]["payment"]["entity"]
-        order_id = payment_entity["order_id"]
-        payment_id = payment_entity["id"]
+        try:
+            payment_entity = payload["payload"]["payment"]["entity"]
+            order_id = payment_entity["order_id"]
+            payment_id = payment_entity["id"]
+        except (KeyError, TypeError):
+            raise HTTPException(400, "Unexpected payload structure for payment.captured")
         notes = payment_entity.get("notes", {})
         email = notes.get("email")
         plan = notes.get("plan")
