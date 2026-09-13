@@ -43,11 +43,13 @@ def _guess_vendor(lines: list[str]) -> Optional[str]:
     for line in candidates[:8]:
         low = line.lower()
         if any(hint in low for hint in VENDOR_LINE_HINTS):
-            return line
+            cut = re.split(r"\b(invoice|dated|gstin|state name|buyer|bill to)\b", line, flags=re.IGNORECASE)[0]
+                return cut.strip()
     for line in candidates:
         low = line.lower()
         if low not in INVOICE_TITLE_STOPWORDS and not any(low.startswith(sw) for sw in INVOICE_TITLE_STOPWORDS):
-            return line
+            cut = re.split(r"\b(invoice|dated|gstin|state name|buyer|bill to)\b", line, flags=re.IGNORECASE)[0]
+                return cut.strip()
     return candidates[0] if candidates else None
 
 
@@ -105,7 +107,20 @@ def _extract_line_items(text: str) -> list[dict]:
                 "amount": m.group(4).replace(",", ""),
             })
     return items
+LABEL_STOPWORDS = ["dated", "gstin", "state", "name", "code", "buyer", "bill", "to", "invoice", "no"]
 
+def _find_invoice_number(text: str) -> Optional[str]:
+    for m in re.finditer(r"(?:invoice|inv|bill|receipt)\s*(?:no\.?|number|#)", text, re.IGNORECASE):
+        window = text[m.end():m.end() + 150]
+        for token in re.split(r"[\s:|]+", window):
+            token = token.strip(".,")
+            if not token:
+                continue
+            if token.lower() in LABEL_STOPWORDS:
+                continue
+            if _has_digit(token) and 3 <= len(token) <= 20:
+                return token
+    return None
 
 def extract_invoice_fields(file_bytes: bytes) -> dict:
     parsed = parse_pdf(file_bytes, extract_tables=True)
@@ -113,7 +128,7 @@ def extract_invoice_fields(file_bytes: bytes) -> dict:
     lines = full_text.splitlines()
 
     vendor = _guess_vendor(lines)
-    invoice_number = _search_first_valid(INVOICE_NUMBER_PATTERNS, full_text, validator=_has_digit)
+    invoice_number = _find_invoice_number(full_text)
     date = _search_first_valid(DATE_PATTERNS, full_text)
     total = _last_number_on_matching_line(TOTAL_LINE_KEYWORDS, full_text)
     tax = _extract_tax_amount(full_text)
