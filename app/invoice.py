@@ -99,6 +99,102 @@ TAX_ID_PATTERNS = [
 ]
 
 
+BUYER_MARKER_PATTERN = re.compile(r"\b(bill\s*to|buyer|consignee|ship\s*to|sold\s*to)\b", re.IGNORECASE)
+ADDRESS_STOP_PATTERN = re.compile(r"^(gstin|gst\s*no|vat|state\s*name|invoice|dated|description|sl\b)", re.IGNORECASE)
+PHONE_PATTERN = re.compile(r"(?:ph\.?|phone|tel\.?|contact|mobile)\s*[:\-]?\s*([\d][\d\-\+\(\)\s]{6,18}\d)", re.IGNORECASE)
+
+
+def _guess_buyer_name_with_index(lines: list[str]):
+    for i, line in enumerate(lines):
+        if BUYER_MARKER_PATTERN.search(line):
+            for j in range(i, min(i + 4, len(lines))):
+                candidate = BUYER_MARKER_PATTERN.sub("", lines[j])
+                candidate = re.sub(r"[:\(\)]", "", candidate).strip()
+                if candidate and not ADDRESS_STOP_PATTERN.match(candidate):
+                    if "," in candidate:
+                        name_part, addr_part = candidate.split(",", 1)
+                        return name_part.strip(), addr_part.strip(), j
+                    return candidate, None, j
+            break
+    return None, None, None
+
+
+def _guess_buyer_name(lines: list[str]) -> Optional[str]:
+    name, _, _ = _guess_buyer_name_with_index(lines)
+    return name
+
+
+def _guess_address_block(lines: list[str], start_idx: int, max_lines: int = 3) -> Optional[str]:
+    collected = []
+    for j in range(start_idx + 1, min(start_idx + 1 + max_lines, len(lines))):
+        line = lines[j].strip()
+        if not line or ADDRESS_STOP_PATTERN.match(line) or BUYER_MARKER_PATTERN.search(line):
+            break
+        collected.append(line)
+    return ", ".join(collected) if collected else None
+
+
+def _find_seller_buyer_addresses(lines: list[str], vendor_idx: Optional[int], buyer_name_idx: Optional[int], inline_buyer_addr: Optional[str]):
+    seller_address = _guess_address_block(lines, vendor_idx) if vendor_idx is not None else None
+    if buyer_name_idx is not None:
+        rest_of_block = _guess_address_block(lines, buyer_name_idx)
+        if inline_buyer_addr and rest_of_block:
+            buyer_address = inline_buyer_addr + ", " + rest_of_block
+        else:
+            buyer_address = inline_buyer_addr or rest_of_block
+    else:
+        buyer_address = None
+    return seller_address, buyer_address
+
+
+def _find_phones(text: str, buyer_marker_pos: Optional[int]):
+    seller_phone, buyer_phone = None, None
+    for m in PHONE_PATTERN.finditer(text):
+        digits = re.sub(r"\D", "", m.group(1))
+        if len(digits) < 7:
+            continue
+        if buyer_marker_pos is not None and m.start() >= buyer_marker_pos:
+            if buyer_phone is None:
+                buyer_phone = m.group(1).strip()
+        else:
+            if seller_phone is None:
+                seller_phone = m.group(1).strip()
+    return seller_phone, buyer_phone
+
+
+def _find_financial_year(text: str, invoice_number: Optional[str]) -> Optional[str]:
+    m = re.search(r"(?:financial\s*year|f\.?y\.?)\s*[:\-]?\s*(\d{4}\s*[-/]\s*\d{2,4})", text, re.IGNORECASE)
+    if m:
+        return m.group(1).replace(" ", "")
+    if invoice_number:
+        m2 = re.search(r"\b(\d{2})(\d{2})\b", invoice_number)
+        if m2:
+            yy1, yy2 = m2.group(1), m2.group(2)
+            if int(yy2) - int(yy1) == 1 or (yy1 == "99" and yy2 == "00"):
+                return f"20{yy1}-{yy2}"
+    return None
+
+
+def _find_invoice_type(text: str) -> Optional[str]:
+    m = re.search(r"(?:invoice\s*type|payment\s*type|terms?)\s*[:\-]?\s*(cash|credit)\b", text, re.IGNORECASE)
+    if m:
+        return m.group(1).capitalize()
+    if re.search(r"\bcash\s*(sale|invoice|bill|memo)\b", text, re.IGNORECASE):
+        return "Cash"
+    if re.search(r"\b(net\s*\d{1,3}|credit\s*terms|due\s*date)\b", text, re.IGNORECASE):
+        return "Credit"
+    return None
+
+
+def _find_amount_in_words(text: str) -> Optional[str]:
+    m = re.search(r"amount\s*(?:chargeable\s*)?\(?in\s*words\)?\s*[:\-]?\s*(.+)", text, re.IGNORECASE)
+    if m:
+        val = m.group(1).strip()
+        val = re.split(r"\n|declaration|e\.\s*&\s*o\.e", val, flags=re.IGNORECASE)[0]
+        return val.strip(" .")
+    return None
+
+
 def _has_digit(s: str) -> bool:
     return any(c.isdigit() for c in s)
 
@@ -113,32 +209,51 @@ def _search_first_valid(patterns, text, flags=re.IGNORECASE, validator=None):
 
 
 def _find_invoice_number(text: str) -> Optional[str]:
-    for m in re.finditer(r"(?:tax\s*invoice|invoice|inv|bill|receipt|order)\s*(?:no\.?|number|num|#|id)", text, re.IGNORECASE):
-        window = text[m.end():m.end() + 150]
-        for token in re.split(r"[\s:|]+", window):
-            token = token.strip(".,")
-            if not token:
-                continue
-            if token.lower() in LABEL_STOPWORDS:
-                continue
-            if _has_digit(token) and 3 <= len(token) <= 20:
-                return token
-    return None
+    def _search(pattern):
+        for m in re.finditer(pattern, text, re.IGNORECASE):
+            window = text[m.end():m.end() + 150]
+            for token in re.split(r"[\s:|]+", window):
+                token = token.strip(".,")
+                if not token:
+                    continue
+                if token.lower() in LABEL_STOPWORDS:
+                    continue
+                if _has_digit(token) and 3 <= len(token) <= 20:
+                    return token
+        return None
+
+    result = _search(r"(?:tax\s*invoice|invoice|inv|bill|receipt)\s*(?:no\.?|number|num|#|id)")
+    if result:
+        return result
+    return _search(r"order\s*(?:no\.?|number|num|#|id)")
 
 
-def _guess_vendor(lines: list[str]) -> Optional[str]:
-    candidates = [l.strip() for l in lines if l.strip()]
-    for line in candidates[:8]:
+def _guess_vendor_with_index(lines: list[str]):
+    for i, raw in enumerate(lines):
+        line = raw.strip()
+        if not line:
+            continue
         low = line.lower()
         if any(re.search(r"\b" + re.escape(hint) + r"\b", low) for hint in VENDOR_LINE_HINTS):
             cut = re.split(r"\b(invoice|dated|gstin|state name|buyer|bill to)\b", line, flags=re.IGNORECASE)[0]
-            return cut.strip()
-    for line in candidates:
+            return cut.strip(), i
+        if i >= 8:
+            break
+    for i, raw in enumerate(lines):
+        line = raw.strip()
+        if not line:
+            continue
         low = line.lower()
         if low not in INVOICE_TITLE_STOPWORDS and not any(low.startswith(sw) for sw in INVOICE_TITLE_STOPWORDS):
             cut = re.split(r"\b(invoice|dated|gstin|state name|buyer|bill to)\b", line, flags=re.IGNORECASE)[0]
-            return cut.strip()
-    return candidates[0] if candidates else None
+            return cut.strip(), i
+    first = next((l.strip() for l in lines if l.strip()), None)
+    return first, (0 if first else None)
+
+
+def _guess_vendor(lines: list[str]) -> Optional[str]:
+    name, _ = _guess_vendor_with_index(lines)
+    return name
 
 
 def _last_number_on_matching_line(keyword_patterns, text, require_decimal=False):
@@ -256,6 +371,36 @@ def _find_desc_and_tail(rest: str):
     return desc, tail
 
 
+def _parse_item_tail(tail: str, amount: str):
+    """Standard Indian invoice line order after description:
+    HSN/SAC (4+ digit code) -> Qty -> Rate -> GST% -> Amount.
+    Classifies tokens by shape rather than position so it tolerates
+    missing HSN or missing GST% columns."""
+    tokens = tail.strip().split()
+    hsn_sac = None
+    gst_rate = None
+    qty = None
+    rate = None
+    for tok in tokens:
+        clean = tok.strip(",")
+        if clean.endswith("%"):
+            gst_rate = clean.rstrip("%")
+            continue
+        plain = clean.replace(",", "")
+        if not re.fullmatch(r"\d+\.?\d*", plain):
+            continue
+        if plain == amount:
+            continue
+        if re.fullmatch(r"\d+", plain) and len(plain) >= 4 and hsn_sac is None and qty is None:
+            hsn_sac = plain
+            continue
+        if qty is None:
+            qty = plain
+        elif rate is None:
+            rate = plain
+    return hsn_sac, qty, rate, gst_rate
+
+
 def _extract_line_items_generic(text: str) -> list[dict]:
     items = []
     for raw_line in text.splitlines():
@@ -281,19 +426,16 @@ def _extract_line_items_generic(text: str) -> list[dict]:
             continue
         if desc.rstrip().endswith(":"):
             continue
-        numeric_tokens = re.findall(r"[\d,]+\.?\d*", tail)
         item = {"description": desc, "amount": amount}
-        candidates = [t for t in numeric_tokens if t.replace(",", "") != amount]
-
-        def _looks_like_code(tok):
-            plain = tok.replace(",", "")
-            return plain.isdigit() and len(plain) >= 4
-
-        qty = next((t for t in candidates if not _looks_like_code(t)), None)
-        if qty is None and candidates:
-            qty = candidates[0]
+        hsn_sac, qty, rate, gst_rate = _parse_item_tail(tail, amount)
+        if hsn_sac is not None:
+            item["hsn_sac"] = hsn_sac
         if qty is not None:
-            item["quantity"] = qty.replace(",", "")
+            item["quantity"] = qty
+        if rate is not None:
+            item["unit_price"] = rate
+        if gst_rate is not None:
+            item["gst_rate"] = gst_rate
         items.append(item)
     return items
 
@@ -391,10 +533,23 @@ def extract_invoice_fields(file_bytes: bytes) -> dict:
     lines = full_text.splitlines()
     all_tables = [t for p in parsed["pages"] for t in p.get("tables", [])]
 
-    vendor = _guess_vendor(lines)
+    vendor, vendor_idx = _guess_vendor_with_index(lines)
+    buyer_name, inline_buyer_addr, buyer_name_idx = _guess_buyer_name_with_index(lines)
+    seller_address, buyer_address = _find_seller_buyer_addresses(lines, vendor_idx, buyer_name_idx, inline_buyer_addr)
+
+    buyer_marker_match = BUYER_MARKER_PATTERN.search(full_text)
+    seller_phone, buyer_phone = _find_phones(full_text, buyer_marker_match.start() if buyer_marker_match else None)
+
     invoice_number = _find_invoice_number(full_text)
     date = _search_first_valid(DATE_PATTERNS, full_text)
     total = _last_number_on_matching_line(TOTAL_LINE_KEYWORDS, full_text)
+    taxable_value = _last_number_on_matching_line(
+        [r"taxable\s*value", r"taxable\s*amount", r"^subtotal\b", r"net\s*amount"], full_text
+    )
+    discount_amount = _last_number_on_matching_line([r"discount"], full_text)
+    financial_year = _find_financial_year(full_text, invoice_number)
+    invoice_type = _find_invoice_type(full_text)
+    amount_in_words = _find_amount_in_words(full_text)
 
     line_items = _extract_line_items_from_tables(all_tables)
     if not line_items:
@@ -421,11 +576,21 @@ def extract_invoice_fields(file_bytes: bytes) -> dict:
 
     return {
         "vendor": vendor,
+        "seller_address": seller_address,
+        "seller_phone": seller_phone,
         "seller_gstin": seller_gstin,
+        "buyer_name": buyer_name,
+        "buyer_address": buyer_address,
+        "buyer_phone": buyer_phone,
         "buyer_gstin": buyer_gstin,
         "invoice_number": invoice_number,
+        "invoice_type": invoice_type,
+        "financial_year": financial_year,
         "date": date,
+        "taxable_value": taxable_value,
+        "discount_amount": discount_amount,
         "total_amount": total,
+        "amount_in_words": amount_in_words,
         "tax_amount": tax,
         "cgst_amount": tax_components["cgst_amount"],
         "sgst_amount": tax_components["sgst_amount"],
