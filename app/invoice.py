@@ -3,7 +3,9 @@ Invoice/receipt structured-field extraction.
 Built on top of the generic text/table extraction in parser.py.
 Uses table-structure extraction where available, with a general
 text-line heuristic fallback for invoices without ruled table borders
-(the common case for most real-world invoices).
+(the common case for most real-world invoices). Also infers CGST/SGST
+vs IGST split from seller/buyer GSTIN state codes when the source
+document states only a combined tax figure.
 """
 import re
 from typing import Optional
@@ -56,6 +58,21 @@ LINE_ITEM_SKIP_KEYWORDS = ['total', 'subtotal', 'tax', 'cgst', 'sgst', 'igst', '
                             'consignee', 'terms', 'note', 'company', 'pan', 'round off',
                             'rounding', 'less :', 'less:', 'payable']
 LINE_ITEM_HEADER_KEYWORDS = ['description', 'particulars', 'qty', 'quantity', 'rate', 'amount', 'hsn', 'sac', 'goods']
+
+GST_STATE_CODES = {
+    "01": "Jammu and Kashmir", "02": "Himachal Pradesh", "03": "Punjab", "04": "Chandigarh",
+    "05": "Uttarakhand", "06": "Haryana", "07": "Delhi", "08": "Rajasthan",
+    "09": "Uttar Pradesh", "10": "Bihar", "11": "Sikkim", "12": "Arunachal Pradesh",
+    "13": "Nagaland", "14": "Manipur", "15": "Mizoram", "16": "Tripura",
+    "17": "Meghalaya", "18": "Assam", "19": "West Bengal", "20": "Jharkhand",
+    "21": "Odisha", "22": "Chhattisgarh", "23": "Madhya Pradesh", "24": "Gujarat",
+    "25": "Daman and Diu", "26": "Dadra and Nagar Haveli", "27": "Maharashtra",
+    "28": "Andhra Pradesh (old)", "29": "Karnataka", "30": "Goa", "31": "Lakshadweep",
+    "32": "Kerala", "33": "Tamil Nadu", "34": "Puducherry", "35": "Andaman and Nicobar Islands",
+    "36": "Telangana", "37": "Andhra Pradesh", "38": "Ladakh",
+}
+GSTIN_PATTERN = r"\b\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]\b"
+BUYER_SECTION_MARKERS = [r"\bbill\s*to\b", r"\bbuyer\b", r"\bconsignee\b", r"\bship\s*to\b", r"\bsold\s*to\b"]
 
 
 def _has_digit(s: str) -> bool:
@@ -146,8 +163,6 @@ def _extract_tax_components(text: str) -> dict:
 
 
 def _extract_line_items_from_tables(all_tables: list) -> list[dict]:
-    """Uses the PDF's real table structure when pdfplumber can detect one
-    (requires ruled grid lines) -- most reliable when it applies."""
     for table in all_tables:
         if not table or len(table) < 2:
             continue
@@ -185,10 +200,6 @@ def _extract_line_items_from_tables(all_tables: list) -> list[dict]:
 
 
 def _extract_line_items_generic(text: str) -> list[dict]:
-    """General-purpose fallback for invoices with no detectable table
-    structure (the common case). Matches any line with a description
-    followed by a proper decimal amount, tolerant of an optional leading
-    serial number, HSN/SAC codes, and unit labels mixed in."""
     items = []
     for raw_line in text.splitlines():
         stripped = raw_line.strip()
@@ -250,6 +261,55 @@ def _sum_table_tax_column(all_tables: list) -> Optional[str]:
     return None
 
 
+def _extract_seller_buyer_gstins(text: str):
+    matches = list(re.finditer(GSTIN_PATTERN, text))
+    if not matches:
+        return None, None
+    buyer_marker = None
+    for kw in BUYER_SECTION_MARKERS:
+        m = re.search(kw, text, re.IGNORECASE)
+        if m and (buyer_marker is None or m.start() < buyer_marker):
+            buyer_marker = m.start()
+    seller, buyer = None, None
+    for m in matches:
+        val = m.group(0)
+        if buyer_marker is not None and m.start() >= buyer_marker:
+            if buyer is None:
+                buyer = val
+        elif seller is None:
+            seller = val
+    if seller is None:
+        seller = matches[0].group(0)
+    if buyer is None:
+        for m in matches:
+            if m.group(0) != seller:
+                buyer = m.group(0)
+                break
+    return seller, buyer
+
+
+def _infer_tax_split(tax_amount, seller_gstin, buyer_gstin, full_text):
+    if tax_amount is None:
+        return None, None, None, None
+    seller_state = GST_STATE_CODES.get(seller_gstin[:2]) if seller_gstin else None
+    buyer_state = GST_STATE_CODES.get(buyer_gstin[:2]) if buyer_gstin else None
+    if not buyer_state:
+        m = re.search(r"place\s*of\s*supply\s*[:\-]?\s*([A-Za-z &]+)", full_text, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip().lower()
+            for name in GST_STATE_CODES.values():
+                if name.lower() in candidate:
+                    buyer_state = name
+                    break
+    if not seller_state or not buyer_state:
+        return None, None, None, None
+    amt = float(tax_amount)
+    if seller_state == buyer_state:
+        half = round(amt / 2, 2)
+        return f"{half:.2f}", f"{half:.2f}", None, "inferred_same_state"
+    return None, None, f"{amt:.2f}", "inferred_different_state"
+
+
 def extract_invoice_fields(file_bytes: bytes) -> dict:
     parsed = parse_pdf(file_bytes, extract_tables=True)
     full_text = parsed["full_text"]
@@ -270,12 +330,24 @@ def extract_invoice_fields(file_bytes: bytes) -> dict:
         tax = _sum_table_tax_column(all_tables)
 
     tax_components = _extract_tax_components(full_text)
+    seller_gstin, buyer_gstin = _extract_seller_buyer_gstins(full_text)
+
+    tax_split_source = "stated" if any(tax_components.values()) else None
+    if not any(tax_components.values()) and tax is not None:
+        cgst, sgst, igst, basis = _infer_tax_split(tax, seller_gstin, buyer_gstin, full_text)
+        if basis:
+            tax_components["cgst_amount"] = cgst
+            tax_components["sgst_amount"] = sgst
+            tax_components["igst_amount"] = igst
+            tax_split_source = basis
 
     fields_found = sum(1 for v in [vendor, invoice_number, date, total] if v)
     confidence = round(fields_found / 4, 2)
 
     return {
         "vendor": vendor,
+        "seller_gstin": seller_gstin,
+        "buyer_gstin": buyer_gstin,
         "invoice_number": invoice_number,
         "date": date,
         "total_amount": total,
@@ -285,6 +357,7 @@ def extract_invoice_fields(file_bytes: bytes) -> dict:
         "igst_amount": tax_components["igst_amount"],
         "vat_amount": tax_components["vat_amount"],
         "sales_tax_amount": tax_components["sales_tax_amount"],
+        "tax_split_source": tax_split_source,
         "line_items": line_items,
         "confidence": confidence,
         "page_count": parsed["page_count"],
