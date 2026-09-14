@@ -1,8 +1,9 @@
 """
 Invoice/receipt structured-field extraction.
 Built on top of the generic text/table extraction in parser.py.
-Uses table-structure extraction where available (most reliable), with
-regex/heuristic fallback on raw text for invoices without real tables.
+Uses table-structure extraction where available, with a general
+text-line heuristic fallback for invoices without ruled table borders
+(the common case for most real-world invoices).
 """
 import re
 from typing import Optional
@@ -48,6 +49,13 @@ TABLE_HEADER_HINTS = {
     "tax": ["tax", "gst", "vat", "cgst", "sgst", "igst"],
     "amount": ["amount", "total", "value"],
 }
+
+LINE_ITEM_SKIP_KEYWORDS = ['total', 'subtotal', 'tax', 'cgst', 'sgst', 'igst', 'vat', 'amount in words',
+                            'declaration', 'gstin', 'invoice', 'bill to', 'buyer', 'ship to',
+                            'place of supply', 'authorised', 'signatory', 'e. & o.e', 'sold by',
+                            'consignee', 'terms', 'note', 'company', 'pan', 'round off',
+                            'rounding', 'less :', 'less:', 'payable']
+LINE_ITEM_HEADER_KEYWORDS = ['description', 'particulars', 'qty', 'quantity', 'rate', 'amount', 'hsn', 'sac', 'goods']
 
 
 def _has_digit(s: str) -> bool:
@@ -138,8 +146,8 @@ def _extract_tax_components(text: str) -> dict:
 
 
 def _extract_line_items_from_tables(all_tables: list) -> list[dict]:
-    """Match a table's header row generically to description/qty/rate/tax/amount
-    columns, then map every data row. Works regardless of column order or count."""
+    """Uses the PDF's real table structure when pdfplumber can detect one
+    (requires ruled grid lines) -- most reliable when it applies."""
     for table in all_tables:
         if not table or len(table) < 2:
             continue
@@ -151,7 +159,7 @@ def _extract_line_items_from_tables(all_tables: list) -> list[dict]:
                     if key not in col_map:
                         col_map[key] = i
         if "description" not in col_map or "amount" not in col_map:
-            continue  # not a line-items table
+            continue
 
         items = []
         for row in table[1:]:
@@ -176,26 +184,42 @@ def _extract_line_items_from_tables(all_tables: list) -> list[dict]:
     return []
 
 
-def _extract_line_items_regex(text: str) -> list[dict]:
-    """Fallback for invoices without a real extractable table structure."""
+def _extract_line_items_generic(text: str) -> list[dict]:
+    """General-purpose fallback for invoices with no detectable table
+    structure (the common case). Matches any line with a description
+    followed by a proper decimal amount, tolerant of an optional leading
+    serial number, HSN/SAC codes, and unit labels mixed in."""
     items = []
-    pattern = re.compile(
-        r"^\s*\d+\s+(.{3,60}?)\s+(?:\d{4,8}\s+)?"
-        r"([\d,]+\.?\d*)\s*(?:pcs|kg|nos|units?)?\s+"
-        r"(?:[\d,]+\.?\d*\s*(?:pcs|kg|nos|units?)?\s+)?"
-        r"([\d,]+\.?\d*)\s*(?:pcs|kg|nos|units?)?\s+"
-        r"([\d,]+\.?\d*)\s*$",
-        re.IGNORECASE,
-    )
-    for line in text.splitlines():
-        m = pattern.match(line.strip())
-        if m:
-            items.append({
-                "description": m.group(1).strip(),
-                "quantity": m.group(2).replace(",", ""),
-                "unit_price": m.group(3).replace(",", ""),
-                "amount": m.group(4).replace(",", ""),
-            })
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        low = stripped.lower()
+        if any(kw in low for kw in LINE_ITEM_SKIP_KEYWORDS):
+            continue
+        decimals = re.findall(r"[\d,]+\.\d{2}", stripped)
+        if not decimals:
+            continue
+        m_prefix = re.match(r"^\s*\d{1,3}[\.\)]?\s+", stripped)
+        rest = stripped[m_prefix.end():] if m_prefix else stripped
+        if not re.match(r"^[A-Za-z]", rest):
+            continue
+        header_word_count = sum(1 for kw in LINE_ITEM_HEADER_KEYWORDS if kw in low)
+        if header_word_count >= 2:
+            continue
+        amount = decimals[-1].replace(",", "")
+        m_desc = re.match(r"^(.*?)(?=\s+[\d(])", rest)
+        desc = m_desc.group(1).strip() if m_desc else rest.strip()
+        if not desc or len(desc) < 3:
+            continue
+        if desc.rstrip().endswith(":"):
+            continue
+        tail = rest[len(desc):]
+        numeric_tokens = re.findall(r"[\d,]+\.?\d*", tail)
+        item = {"description": desc, "amount": amount}
+        if numeric_tokens and numeric_tokens[0].replace(",", "") != amount:
+            item["quantity"] = numeric_tokens[0].replace(",", "")
+        items.append(item)
     return items
 
 
@@ -239,7 +263,7 @@ def extract_invoice_fields(file_bytes: bytes) -> dict:
 
     line_items = _extract_line_items_from_tables(all_tables)
     if not line_items:
-        line_items = _extract_line_items_regex(full_text)
+        line_items = _extract_line_items_generic(full_text)
 
     tax = _extract_tax_amount(full_text)
     if tax is None:
