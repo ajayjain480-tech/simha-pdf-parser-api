@@ -1,10 +1,13 @@
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+import io
 
 from app import database as db
 from app.auth import verify_request
 from app.parser import parse_pdf, parse_pdf_text_only
 from app.invoice import extract_invoice_fields
+from app.export import build_invoice_xlsx, build_invoice_csv
 from app.payments import router as payments_router
 
 app = FastAPI(
@@ -86,6 +89,68 @@ async def parse_invoice(
 
     result["_meta"] = {"auth_source": auth.get("source")}
     return result
+
+
+def _validate_upload(file: UploadFile, file_bytes: bytes):
+    if file.content_type not in ("application/pdf", "application/octet-stream"):
+        raise HTTPException(400, "Only PDF files are accepted")
+    size_mb = len(file_bytes) / (1024 * 1024)
+    if size_mb > MAX_FILE_SIZE_MB:
+        raise HTTPException(413, f"File exceeds {MAX_FILE_SIZE_MB}MB limit")
+
+
+@app.post("/v1/parse/invoice/excel")
+async def parse_invoice_excel(
+    file: UploadFile = File(...),
+    auth=Depends(verify_request),
+):
+    """
+    Same extraction as /v1/parse/invoice, but returned as a downloadable
+    .xlsx workbook instead of JSON — for non-technical users (accounting/
+    finance teams) who want the data in Excel, not raw JSON.
+    """
+    file_bytes = await file.read()
+    _validate_upload(file, file_bytes)
+
+    try:
+        result = extract_invoice_fields(file_bytes)
+        xlsx_bytes = build_invoice_xlsx(result)
+    except Exception as e:
+        raise HTTPException(422, f"Could not extract invoice fields: {str(e)}")
+
+    filename = f"invoice_{(result.get('invoice_number') or 'export').replace('/', '-')}.xlsx"
+    return StreamingResponse(
+        io.BytesIO(xlsx_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/v1/parse/invoice/csv")
+async def parse_invoice_csv(
+    file: UploadFile = File(...),
+    auth=Depends(verify_request),
+):
+    """
+    Same extraction as /v1/parse/invoice, returned as a downloadable .csv —
+    a lighter alternative to Excel for tools that only accept CSV import
+    (e.g. some Tally/accounting-software import flows).
+    """
+    file_bytes = await file.read()
+    _validate_upload(file, file_bytes)
+
+    try:
+        result = extract_invoice_fields(file_bytes)
+        csv_bytes = build_invoice_csv(result)
+    except Exception as e:
+        raise HTTPException(422, f"Could not extract invoice fields: {str(e)}")
+
+    filename = f"invoice_{(result.get('invoice_number') or 'export').replace('/', '-')}.csv"
+    return StreamingResponse(
+        io.BytesIO(csv_bytes),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.post("/v1/keys/free")
