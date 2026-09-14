@@ -283,8 +283,17 @@ def _extract_line_items_generic(text: str) -> list[dict]:
             continue
         numeric_tokens = re.findall(r"[\d,]+\.?\d*", tail)
         item = {"description": desc, "amount": amount}
-        if numeric_tokens and numeric_tokens[0].replace(",", "") != amount:
-            item["quantity"] = numeric_tokens[0].replace(",", "")
+        candidates = [t for t in numeric_tokens if t.replace(",", "") != amount]
+
+        def _looks_like_code(tok):
+            plain = tok.replace(",", "")
+            return plain.isdigit() and len(plain) >= 4
+
+        qty = next((t for t in candidates if not _looks_like_code(t)), None)
+        if qty is None and candidates:
+            qty = candidates[0]
+        if qty is not None:
+            item["quantity"] = qty.replace(",", "")
         items.append(item)
     return items
 
