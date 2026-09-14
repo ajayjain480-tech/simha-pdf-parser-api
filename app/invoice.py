@@ -130,7 +130,7 @@ def _guess_vendor(lines: list[str]) -> Optional[str]:
     candidates = [l.strip() for l in lines if l.strip()]
     for line in candidates[:8]:
         low = line.lower()
-        if any(hint in low for hint in VENDOR_LINE_HINTS):
+        if any(re.search(r"\b" + re.escape(hint) + r"\b", low) for hint in VENDOR_LINE_HINTS):
             cut = re.split(r"\b(invoice|dated|gstin|state name|buyer|bill to)\b", line, flags=re.IGNORECASE)[0]
             return cut.strip()
     for line in candidates:
@@ -230,10 +230,6 @@ LINE_ITEM_UNIT_WORDS = {'kg', 'kgs', 'ltr', 'ltrs', 'litre', 'litres', 'liter', 
 
 
 def _find_desc_and_tail(rest: str):
-    """Splits 'rest' into (description, tail) at the first standalone
-    numeric token -- treating numbers glued to letters (55in, 65W) and
-    numbers followed by a unit word (40 Kg) as part of the description,
-    not the start of the numeric fields."""
     tokens = rest.split(' ')
     desc_tokens = []
     i = 0
@@ -267,7 +263,7 @@ def _extract_line_items_generic(text: str) -> list[dict]:
         if not stripped:
             continue
         low = stripped.lower()
-        if any(kw in low for kw in LINE_ITEM_SKIP_KEYWORDS):
+        if any(re.search(r"\b" + re.escape(kw) + r"\b", low) for kw in LINE_ITEM_SKIP_KEYWORDS):
             continue
         decimals = re.findall(r"[\d,]+\.\d{2}", stripped)
         if not decimals:
@@ -276,7 +272,7 @@ def _extract_line_items_generic(text: str) -> list[dict]:
         rest = stripped[m_prefix.end():] if m_prefix else stripped
         if not re.match(r"^[A-Za-z]", rest):
             continue
-        header_word_count = sum(1 for kw in LINE_ITEM_HEADER_KEYWORDS if kw in low)
+        header_word_count = sum(1 for kw in LINE_ITEM_HEADER_KEYWORDS if re.search(r"\b" + re.escape(kw) + r"\b", low))
         if header_word_count >= 2:
             continue
         amount = decimals[-1].replace(",", "")
