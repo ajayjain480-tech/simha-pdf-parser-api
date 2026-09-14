@@ -2,10 +2,9 @@
 Invoice/receipt structured-field extraction.
 Built on top of the generic text/table extraction in parser.py.
 Uses table-structure extraction where available, with a general
-text-line heuristic fallback for invoices without ruled table borders
-(the common case for most real-world invoices). Also infers CGST/SGST
-vs IGST split from seller/buyer GSTIN state codes when the source
-document states only a combined tax figure.
+text-line heuristic fallback for invoices without ruled table borders.
+Infers CGST/SGST vs IGST split from seller/buyer GSTIN state codes
+when the source document states only a combined tax figure.
 """
 import re
 from typing import Optional
@@ -22,15 +21,15 @@ DATE_PATTERNS = [
 ]
 
 INVOICE_NUMBER_PATTERNS = [
-    r"(?:invoice|inv|bill|receipt)\s*(?:no\.?|number|#)\s*[:\-]?\s*([A-Za-z0-9][A-Za-z0-9\-\/]{2,20})",
+    r"(?:tax\s*invoice|invoice|inv|bill|receipt|order)\s*(?:no\.?|number|num|#|id)\s*[:\-]?\s*([A-Za-z0-9][A-Za-z0-9\-\/]{2,20})",
 ]
 
 TOTAL_LINE_KEYWORDS = [
     r"grand\s*total", r"total\s*amount", r"amount\s*due", r"total\s*due",
     r"balance\s*due", r"net\s*payable", r"total\s*payable", r"amount\s*payable",
-    r"^total\b",
+    r"total\s*incl", r"total\s*including", r"amount\s*in\s*inr", r"^total\b",
 ]
-TAX_LINE_KEYWORDS = [r"\b(cgst|sgst|igst|gst|vat|tax)\b"]
+TAX_LINE_KEYWORDS = [r"\b(cgst|sgst|igst|utgst|gst|vat|hst|pst|qst|consumption\s*tax|sales\s*tax|tax)\b"]
 
 TAX_COMPONENT_KEYWORDS = {
     "cgst_amount": [r"\bcgst\b"],
@@ -38,25 +37,42 @@ TAX_COMPONENT_KEYWORDS = {
     "igst_amount": [r"\bigst\b"],
     "vat_amount": [r"\bvat\b"],
     "sales_tax_amount": [r"\bsales\s*tax\b"],
+    "gst_amount": [r"(?<!c)(?<!s)(?<!i)(?<!ut)\bgst\b"],
+    "hst_amount": [r"\bhst\b"],
+    "pst_amount": [r"\bpst\b"],
+    "qst_amount": [r"\bqst\b"],
+    "consumption_tax_amount": [r"\bconsumption\s*tax\b"],
 }
 
-VENDOR_LINE_HINTS = ["ltd", "llp", "pvt", "inc", "corp", "technologies", "solutions", "enterprises", "timber", "traders", "industries", "exports", "consulting", "chemicals", "textiles", "agro", "retail", "group"]
-INVOICE_TITLE_STOPWORDS = ["tax invoice", "invoice", "bill", "receipt", "proforma invoice", "credit note", "debit note", "original", "duplicate", "tax invoice / bill of supply"]
-LABEL_STOPWORDS = ["dated", "gstin", "state", "name", "code", "buyer", "bill", "to", "invoice", "no"]
+VENDOR_LINE_HINTS = [
+    "ltd", "llp", "pvt", "inc", "corp", "corporation", "technologies", "solutions",
+    "enterprises", "timber", "traders", "industries", "exports", "consulting",
+    "chemicals", "textiles", "agro", "retail", "group", "co.", "co,", "company",
+    "gmbh", "ag", "sarl", "sas", "s.a.", "s.a", "s.l.", "s.r.l.", "srl", "bv", "b.v.",
+    "nv", "n.v.", "oy", "ab", "as", "a/s", "plc", "kk", "k.k.", "co., ltd", "co ltd",
+    "sdn bhd", "pte", "pte. ltd", "pty", "pty ltd", "oyj", "spa", "s.p.a.",
+]
+INVOICE_TITLE_STOPWORDS = [
+    "tax invoice", "invoice", "bill", "receipt", "proforma invoice", "credit note",
+    "debit note", "original", "duplicate", "tax invoice / bill of supply",
+    "commercial invoice", "sales receipt", "order confirmation", "statement",
+]
+LABEL_STOPWORDS = ["dated", "gstin", "state", "name", "code", "buyer", "bill", "to", "invoice", "no", "date"]
 
 TABLE_HEADER_HINTS = {
-    "description": ["description", "item", "product", "particulars", "goods"],
-    "quantity": ["qty", "quantity"],
-    "unit_price": ["rate", "price", "unit price", "unit rate"],
-    "tax": ["tax", "gst", "vat", "cgst", "sgst", "igst"],
-    "amount": ["amount", "total", "value"],
+    "description": ["description", "item", "product", "particulars", "goods", "details"],
+    "quantity": ["qty", "quantity", "units"],
+    "unit_price": ["rate", "price", "unit price", "unit rate", "unit cost"],
+    "tax": ["tax", "gst", "vat", "cgst", "sgst", "igst", "hst", "pst"],
+    "amount": ["amount", "total", "value", "subtotal"],
 }
 
-LINE_ITEM_SKIP_KEYWORDS = ['total', 'subtotal', 'tax', 'cgst', 'sgst', 'igst', 'vat', 'amount in words',
-                            'declaration', 'gstin', 'invoice', 'bill to', 'buyer', 'ship to',
-                            'place of supply', 'authorised', 'signatory', 'e. & o.e', 'sold by',
-                            'consignee', 'terms', 'note', 'company', 'pan', 'round off',
-                            'rounding', 'less :', 'less:', 'payable']
+LINE_ITEM_SKIP_KEYWORDS = ['total', 'subtotal', 'tax', 'cgst', 'sgst', 'igst', 'utgst', 'gst', 'hst', 'pst', 'qst',
+                            'vat', 'consumption tax', 'amount in words', 'declaration', 'gstin', 'invoice',
+                            'bill to', 'buyer', 'ship to', 'place of supply', 'authorised', 'authorized',
+                            'signatory', 'e. & o.e', 'sold by', 'consignee', 'terms', 'note', 'company', 'pan',
+                            'round off', 'rounding', 'less :', 'less:', 'payable', 'iban', 'swift', 'bank details',
+                            'routing number', 'account number', 'payment terms']
 LINE_ITEM_HEADER_KEYWORDS = ['description', 'particulars', 'qty', 'quantity', 'rate', 'amount', 'hsn', 'sac', 'goods']
 
 GST_STATE_CODES = {
@@ -74,6 +90,14 @@ GST_STATE_CODES = {
 GSTIN_PATTERN = r"\b\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]\b"
 BUYER_SECTION_MARKERS = [r"\bbill\s*to\b", r"\bbuyer\b", r"\bconsignee\b", r"\bship\s*to\b", r"\bsold\s*to\b"]
 
+TAX_ID_PATTERNS = [
+    ("GSTIN", GSTIN_PATTERN),
+    ("VAT", r"\bVAT\s*(?:Reg(?:istration)?\.?\s*(?:No\.?|Number)?|No\.?)\s*[:\-]?\s*([A-Z]{2}\s?[\d\s]{7,12})"),
+    ("EIN", r"\bEIN[:\s]*(\d{2}-\d{7})\b"),
+    ("ABN", r"\bABN[:\s]*([\d\s]{9,14})\b"),
+    ("IEC", r"\bIEC[:\s]*([A-Z0-9]{8,10})\b"),
+]
+
 
 def _has_digit(s: str) -> bool:
     return any(c.isdigit() for c in s)
@@ -89,7 +113,7 @@ def _search_first_valid(patterns, text, flags=re.IGNORECASE, validator=None):
 
 
 def _find_invoice_number(text: str) -> Optional[str]:
-    for m in re.finditer(r"(?:invoice|inv|bill|receipt)\s*(?:no\.?|number|#)", text, re.IGNORECASE):
+    for m in re.finditer(r"(?:tax\s*invoice|invoice|inv|bill|receipt|order)\s*(?:no\.?|number|num|#|id)", text, re.IGNORECASE):
         window = text[m.end():m.end() + 150]
         for token in re.split(r"[\s:|]+", window):
             token = token.strip(".,")
@@ -199,6 +223,43 @@ def _extract_line_items_from_tables(all_tables: list) -> list[dict]:
     return []
 
 
+LINE_ITEM_UNIT_WORDS = {'kg', 'kgs', 'ltr', 'ltrs', 'litre', 'litres', 'liter', 'liters', 'ml', 'gm', 'gms',
+                         'gram', 'grams', 'mm', 'cm', 'in', 'inch', 'inches', 'w', 'watt', 'watts', 'gsm',
+                         'oz', 'lb', 'lbs', 'pcs', 'nos', 'unit', 'units', 'mtr', 'mtrs', 'meter', 'meters',
+                         'ft', 'feet', 'yd', 'yard', 'yards', 'box', 'boxes', 'set', 'sets', 'pair', 'pairs'}
+
+
+def _find_desc_and_tail(rest: str):
+    """Splits 'rest' into (description, tail) at the first standalone
+    numeric token -- treating numbers glued to letters (55in, 65W) and
+    numbers followed by a unit word (40 Kg) as part of the description,
+    not the start of the numeric fields."""
+    tokens = rest.split(' ')
+    desc_tokens = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        clean = tok.strip('(),')
+        is_plain_number = bool(re.fullmatch(r'[\d,]+\.?\d*', clean))
+        is_glued_number = bool(re.fullmatch(r'[\d,]+\.?\d*[A-Za-z]+', clean)) and not is_plain_number
+        if is_glued_number:
+            desc_tokens.append(tok)
+            i += 1
+            continue
+        if is_plain_number:
+            next_tok = tokens[i + 1].strip('.,').lower() if i + 1 < len(tokens) else ''
+            if next_tok in LINE_ITEM_UNIT_WORDS:
+                desc_tokens.append(tok)
+                i += 1
+                continue
+            break
+        desc_tokens.append(tok)
+        i += 1
+    desc = ' '.join(desc_tokens).strip()
+    tail = ' ' + ' '.join(tokens[i:]) if i < len(tokens) else ''
+    return desc, tail
+
+
 def _extract_line_items_generic(text: str) -> list[dict]:
     items = []
     for raw_line in text.splitlines():
@@ -219,13 +280,11 @@ def _extract_line_items_generic(text: str) -> list[dict]:
         if header_word_count >= 2:
             continue
         amount = decimals[-1].replace(",", "")
-        m_desc = re.match(r"^(.*?)(?=\s+[\d(])", rest)
-        desc = m_desc.group(1).strip() if m_desc else rest.strip()
+        desc, tail = _find_desc_and_tail(rest)
         if not desc or len(desc) < 3:
             continue
         if desc.rstrip().endswith(":"):
             continue
-        tail = rest[len(desc):]
         numeric_tokens = re.findall(r"[\d,]+\.?\d*", tail)
         item = {"description": desc, "amount": amount}
         if numeric_tokens and numeric_tokens[0].replace(",", "") != amount:
@@ -310,6 +369,17 @@ def _infer_tax_split(tax_amount, seller_gstin, buyer_gstin, full_text):
     return None, None, f"{amt:.2f}", "inferred_different_state"
 
 
+def _find_tax_ids(text: str) -> list:
+    matches = []
+    for typ, pat in TAX_ID_PATTERNS:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            val = (m.group(1) if m.groups() else m.group(0)).strip()
+            val = re.sub(r"\s+", " ", val).upper()
+            matches.append((m.start(), typ, val))
+    matches.sort(key=lambda x: x[0])
+    return matches
+
+
 def extract_invoice_fields(file_bytes: bytes) -> dict:
     parsed = parse_pdf(file_bytes, extract_tables=True)
     full_text = parsed["full_text"]
@@ -357,6 +427,11 @@ def extract_invoice_fields(file_bytes: bytes) -> dict:
         "igst_amount": tax_components["igst_amount"],
         "vat_amount": tax_components["vat_amount"],
         "sales_tax_amount": tax_components["sales_tax_amount"],
+        "gst_amount": tax_components["gst_amount"],
+        "hst_amount": tax_components["hst_amount"],
+        "pst_amount": tax_components["pst_amount"],
+        "qst_amount": tax_components["qst_amount"],
+        "consumption_tax_amount": tax_components["consumption_tax_amount"],
         "tax_split_source": tax_split_source,
         "line_items": line_items,
         "confidence": confidence,
