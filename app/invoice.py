@@ -222,6 +222,9 @@ def _find_invoice_number(text: str) -> Optional[str]:
                     return token
         return None
 
+    # "Invoice/Bill/Receipt No." always takes priority over "Order ID" --
+    # many e-commerce invoices show both, and the real invoice number is
+    # what matters, not the order reference.
     result = _search(r"(?:tax\s*invoice|invoice|inv|bill|receipt)\s*(?:no\.?|number|num|#|id)")
     if result:
         return result
@@ -527,6 +530,22 @@ def _find_tax_ids(text: str) -> list:
     return matches
 
 
+IRN_PATTERN = r"(?:IRN|Invoice\s*Reference\s*Number)\s*[:\-]?\s*([a-fA-F0-9]{64})"
+ACK_NO_PATTERN = r"Ack(?:nowledgement)?\s*(?:No\.?|Number)\s*[:\-]?\s*(\d{10,20})"
+ACK_DATE_PATTERN = r"Ack(?:nowledgement)?\s*Date\s*[:\-]?\s*([\d]{1,2}[\-/\.](?:\d{1,2}|[A-Za-z]{3,9})[\-/\.]\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?|[\d]{4}[\-/][\d]{1,2}[\-/][\d]{1,2})"
+
+
+def _find_e_invoice_fields(text: str):
+    irn_match = re.search(IRN_PATTERN, text, re.IGNORECASE)
+    irn = irn_match.group(1) if irn_match else None
+    ack_no_match = re.search(ACK_NO_PATTERN, text, re.IGNORECASE)
+    ack_no = ack_no_match.group(1) if ack_no_match else None
+    ack_date_match = re.search(ACK_DATE_PATTERN, text, re.IGNORECASE)
+    ack_date = ack_date_match.group(1) if ack_date_match else None
+    is_e_invoice = irn is not None
+    return irn, ack_no, ack_date, is_e_invoice
+
+
 def extract_invoice_fields(file_bytes: bytes) -> dict:
     parsed = parse_pdf(file_bytes, extract_tables=True)
     full_text = parsed["full_text"]
@@ -571,6 +590,8 @@ def extract_invoice_fields(file_bytes: bytes) -> dict:
             tax_components["igst_amount"] = igst
             tax_split_source = basis
 
+    irn, ack_no, ack_date, is_e_invoice = _find_e_invoice_fields(full_text)
+
     fields_found = sum(1 for v in [vendor, invoice_number, date, total] if v)
     confidence = round(fields_found / 4, 2)
 
@@ -603,6 +624,10 @@ def extract_invoice_fields(file_bytes: bytes) -> dict:
         "qst_amount": tax_components["qst_amount"],
         "consumption_tax_amount": tax_components["consumption_tax_amount"],
         "tax_split_source": tax_split_source,
+        "is_e_invoice": is_e_invoice,
+        "irn": irn,
+        "ack_no": ack_no,
+        "ack_date": ack_date,
         "line_items": line_items,
         "confidence": confidence,
         "page_count": parsed["page_count"],
