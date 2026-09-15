@@ -549,6 +549,14 @@ def _find_e_invoice_fields(text: str):
 def extract_invoice_fields(file_bytes: bytes) -> dict:
     parsed = parse_pdf(file_bytes, extract_tables=True)
     full_text = parsed["full_text"]
+
+    if len(full_text.strip()) < 20:
+        raise ValueError(
+            "No extractable text found in this PDF. This usually means it's a "
+            "scanned image or photo of an invoice rather than a text-based PDF. "
+            "OCR for scanned documents is not currently supported."
+        )
+
     lines = full_text.splitlines()
     all_tables = [t for p in parsed["pages"] for t in p.get("tables", [])]
 
